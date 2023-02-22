@@ -14,7 +14,7 @@ import os
 import sys
 import importlib
 import logging
-
+import dill
 
 SBOL = 'http://sbols.org/v3#'
 OM = 'http://www.ontology-of-units-of-measure.org/resource/om-2/'
@@ -26,11 +26,11 @@ LOGGER = logging.getLogger(__name__)
 
 # create console handler with a higher log level
 ch = logging.StreamHandler()
-ch.setLevel(logging.INFO)
+ch.setLevel(logging.DEBUG)
 ch.setFormatter(logging.Formatter('%(message)s'))
 LOGGER.addHandler(ch)
 ch2 = logging.StreamHandler()
-ch2.setLevel(logging.ERROR)
+ch2.setLevel(logging.DEBUG)
 ch2.setFormatter(logging.Formatter('[%(levelname)s] %(filename)s %(lineno)d: %(message)s'))
 LOGGER.addHandler(ch2)
 
@@ -39,7 +39,7 @@ class Document(sbol.Document):
 
     def __init__(self):
         super(Document, self).__init__()
-        self._validator = ShaclValidator()        
+        self._validator = ShaclValidator()
 
     def validate(self):
         conforms, results_graph, results_txt = self._validator.validate(self.graph())
@@ -84,12 +84,16 @@ class SBOLFactory():
             SBOLFactory.namespace_to_prefix[str(ns)] = prefix
             # TODO: handle namespace with conflicting prefixes
 
+        PKL_ROOT = f"/tmp/sbol/{module_name}"
+
         # Use ontology prefix as module name
-        ontology_namespace = ontology_namespace
         SBOLFactory.query = Query(ontology_path)
         symbol_table = {}
         for class_uri in SBOLFactory.query.query_classes():
-            symbol_table = SBOLFactory.generate(class_uri, symbol_table, ontology_namespace)
+            symbol_table = SBOLFactory.generate(class_uri,
+                                                symbol_table,
+                                                ontology_namespace,
+                                                PKL_ROOT)
 
         spec = importlib.util.spec_from_loader(
             module_name,
@@ -101,17 +105,27 @@ class SBOLFactory():
         return module
 
     @staticmethod
-    def generate(class_uri, symbol_table, ontology_namespace):
-        log = ''
-        if ontology_namespace not in class_uri: 
+    def generate(class_uri, symbol_table, ontology_namespace, pkl_root):
+        if ontology_namespace not in class_uri:
             return symbol_table
 
         # Recurse into superclass
         superclass_uri = SBOLFactory.query.query_superclass(class_uri)
-        symbol_table = SBOLFactory.generate(superclass_uri, symbol_table, ontology_namespace)
+        symbol_table = SBOLFactory.generate(superclass_uri,
+                                            symbol_table,
+                                            ontology_namespace,
+                                            pkl_root)
 
         CLASS_URI = class_uri
         CLASS_NAME = sbol.utils.parse_class_name(class_uri)
+
+        path = os.path.join(pkl_root, CLASS_NAME + ".pkl")
+        using_cache = False
+        if os.path.exists(path):
+            LOGGER.debug("Using cache for %s", CLASS_NAME)
+            using_cache = True
+            with open(path, "rb") as f:
+                Class = dill.load(f)
 
         if SBOLFactory.get_constructor(class_uri, symbol_table):  # Abort if the class has already been generated
             return symbol_table
@@ -126,21 +140,44 @@ class SBOLFactory():
 
         # Collect property information for constructor, cached outside for speed
         # Object properties can be either compositional or associative
-        property_uris = SBOLFactory.query.query_object_properties(CLASS_URI)
-        compositional_properties = SBOLFactory.query.query_compositional_properties(CLASS_URI)
+        if using_cache:
+            print("Using cache for", CLASS_NAME)
+            with open(os.path.join(pkl_root, CLASS_NAME + "prop_uris.pkl"), "rb") as f:
+                property_uris = dill.load(f)
+            with open(os.path.join(pkl_root, CLASS_NAME + "comp_props.pkl"), "rb") as f:
+                compositional_properties = dill.load(f)
+            with open(os.path.join(pkl_root, CLASS_NAME + "datatype_props.pkl"), "rb") as f:
+                datatype_properties = dill.load(f)
+            with open(os.path.join(pkl_root, CLASS_NAME + "prop_names.pkl"), "rb") as f:
+                property_names = dill.load(f)
+        else:
+            print("Not using cache for", CLASS_NAME)
+            os.makedirs(pkl_root, exist_ok=True)
+            property_uris = SBOLFactory.query.query_object_properties(CLASS_URI)
+            with open(os.path.join(pkl_root, CLASS_NAME + "prop_uris.pkl"), "wb") as f:
+                dill.dump(property_uris, f)
+
+            compositional_properties = SBOLFactory.query.query_compositional_properties(CLASS_URI)
+            with open(os.path.join(pkl_root, CLASS_NAME + "comp_props.pkl"), "wb") as f:
+                dill.dump(compositional_properties, f)
+
+            datatype_properties = SBOLFactory.query.query_datatype_properties(CLASS_URI)
+            with open(os.path.join(pkl_root, CLASS_NAME + "datatype_props.pkl"), "wb") as f:
+                dill.dump(datatype_properties, f)
+            property_names = [SBOLFactory.query.query_label(uri) for uri in property_uris]
+            property_names.extend([SBOLFactory.query.query_label(uri) for uri in datatype_properties])
+            property_names = [name.replace(' ', '_') for name in property_names]
+            with open(os.path.join(pkl_root, CLASS_NAME + "prop_names.pkl"), "wb") as f:
+                dill.dump(property_names, f)
+
         associative_properties = [uri for uri in property_uris if uri not in
-                                  compositional_properties]
-        datatype_properties = SBOLFactory.query.query_datatype_properties(CLASS_URI)
-        property_names = [SBOLFactory.query.query_label(uri) for uri in property_uris]
-        property_names.extend([SBOLFactory.query.query_label(uri) for uri in datatype_properties])
-        property_names = [name.replace(' ', '_') for name in property_names]
+                                      compositional_properties]
+
         class_is_top_level = SBOLFactory.query.is_top_level(CLASS_URI)
         all_property_uris = property_uris + datatype_properties
         property_uri_to_name = {uri: SBOLFactory.query.query_label(uri).replace(' ', '_') for uri in all_property_uris}
         property_cardinalities = {uri: SBOLFactory.query.query_cardinality(uri, CLASS_URI) for uri in all_property_uris}
         property_datatypes = {uri: SBOLFactory.query.query_property_datatype(uri, CLASS_URI) for uri in datatype_properties}
-
-
 
         # Define constructor
         def __init__(self, *args, **kwargs):
@@ -182,7 +219,7 @@ class SBOLFactory():
                 if datatypes[0] == 'http://www.w3.org/2001/XMLSchema#string':
                     self.__dict__[property_name] = sbol.TextProperty(self, property_uri, lower_bound, upper_bound)
                 elif datatypes[0] == 'http://www.w3.org/2001/XMLSchema#integer':
-                    self.__dict__[property_name] = sbol.IntProperty(self, property_uri, lower_bound, upper_bound)                    
+                    self.__dict__[property_name] = sbol.IntProperty(self, property_uri, lower_bound, upper_bound)
                 elif datatypes[0] == 'http://www.w3.org/2001/XMLSchema#boolean':
                     self.__dict__[property_name] = sbol.BooleanProperty(self, property_uri, lower_bound, upper_bound)
                 elif datatypes[0] == 'http://www.w3.org/2001/XMLSchema#anyURI':
@@ -206,10 +243,16 @@ class SBOLFactory():
             getattr(visitor, visitor_method)(self)
 
         # Instantiate metaclass
-        attribute_dict = {}
-        attribute_dict['__init__'] = __init__
-        attribute_dict['accept'] = accept
-        Class = type(CLASS_NAME, (Super,), attribute_dict)
+        if not using_cache:
+            attribute_dict = {}
+            attribute_dict['__init__'] = __init__
+            attribute_dict['accept'] = accept
+            Class = type(CLASS_NAME, (Super,), attribute_dict)
+            os.makedirs(pkl_root, exist_ok=True)
+            with open(path, "wb") as f:
+                dill.dump(Class, f)
+
+
 
         #globals()[CLASS_NAME] = Class
         #self.symbol_table[CLASS_NAME] = Class
@@ -243,7 +286,7 @@ class SBOLFactory():
                 datatype = sbol.utils.parse_class_name(datatype[0])
             else:
                 datatype = None
-            lower_bound, upper_bound = SBOLFactory.query.query_cardinality(property_uri, CLASS_URI)            
+            lower_bound, upper_bound = SBOLFactory.query.query_cardinality(property_uri, CLASS_URI)
             LOGGER.info(f'\t{property_name}\t{datatype}\t{lower_bound}\t{upper_bound}\n')
         return symbol_table
 
@@ -269,7 +312,7 @@ class SBOLFactory():
         else:
             raise ValueError(f'Cannot parse namespace from {class_uri}. URI must use either / or # as a delimiter.')
 
-        # Look in the sbol module 
+        # Look in the sbol module
         if namespace == SBOL or namespace == PROVO or namespace == OM:
             return sbol.__dict__[class_name]
 
@@ -302,5 +345,3 @@ class SBOLFactory():
     @staticmethod
     def delete(symbol):
         del globals()[symbol]
-
-
